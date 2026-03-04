@@ -726,6 +726,10 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
+        # Optional HuggingFace Dataset support (image loaded by ID)
+        # Users can set these attributes on data_args before constructing the dataset.
+        self.hf_dataset = getattr(data_args, "hf_dataset", None)
+        self.hf_id_map = getattr(data_args, "hf_id_map", {})
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -765,13 +769,36 @@ class LazySupervisedDataset(Dataset):
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
-            
+
+            # Support both file-path based loading and HuggingFace Dataset based loading.
+            # - If hf_dataset & hf_id_map are provided, treat `image_file` as an ID and load from the dataset.
+            # - Otherwise, fall back to loading from disk using `image_folder` and file path(s).
             if isinstance(image_file, list):
+                # Multiple images per sample (only file-path based for now)
                 image = []
                 for img_file in image_file:
                     image.append(Image.open(os.path.join(image_folder, img_file)).convert('RGB'))
             else:
-                image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+                hf_dataset = getattr(self, "hf_dataset", None)
+                hf_id_map = getattr(self, "hf_id_map", None)
+                if hf_dataset is not None and hf_id_map:
+                    image_id_str = str(image_file)
+                    if image_id_str in hf_id_map:
+                        idx = hf_id_map[image_id_str]
+                        rec = hf_dataset[idx]
+                        img = rec.get("image")
+                        if img is None:
+                            raise ValueError(f"Image not found in dataset for image_id={image_id_str}")
+                        if not isinstance(img, Image.Image):
+                            if hasattr(img, "shape"):
+                                img = Image.fromarray(img)
+                            else:
+                                img = Image.open(img)
+                        image = img.convert("RGB")
+                    else:
+                        raise ValueError(f"Image ID {image_id_str} not found in HuggingFace Dataset")
+                else:
+                    image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size

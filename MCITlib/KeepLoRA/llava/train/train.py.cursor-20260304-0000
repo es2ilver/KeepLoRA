@@ -1,0 +1,3 @@
+#!/usr/bin/env python
+# Backup stub for original train.py before KeepLoRA image-loading modifications.
+# If needed, retrieve the full original version from git history.

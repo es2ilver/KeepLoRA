@@ -770,35 +770,40 @@ class LazySupervisedDataset(Dataset):
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
 
-            # Support both file-path based loading and HuggingFace Dataset based loading.
-            # - If hf_dataset & hf_id_map are provided, treat `image_file` as an ID and load from the dataset.
-            # - Otherwise, fall back to loading from disk using `image_folder` and file path(s).
+            # Two supported formats:
+            # 1) Image by ID: hf_dataset + hf_id_map set → JSON "image" is an ID, load from HF dataset.
+            # 2) Image by path: JSON "image" is a file path relative to image_folder.
             if isinstance(image_file, list):
                 # Multiple images per sample (only file-path based for now)
                 image = []
                 for img_file in image_file:
-                    image.append(Image.open(os.path.join(image_folder, img_file)).convert('RGB'))
+                    img = _open_image_from_path(image_folder, img_file, sample_index=i)
+                    image.append(img)
             else:
                 hf_dataset = getattr(self, "hf_dataset", None)
                 hf_id_map = getattr(self, "hf_id_map", None)
                 if hf_dataset is not None and hf_id_map:
                     image_id_str = str(image_file)
-                    if image_id_str in hf_id_map:
-                        idx = hf_id_map[image_id_str]
-                        rec = hf_dataset[idx]
-                        img = rec.get("image")
-                        if img is None:
-                            raise ValueError(f"Image not found in dataset for image_id={image_id_str}")
-                        if not isinstance(img, Image.Image):
-                            if hasattr(img, "shape"):
-                                img = Image.fromarray(img)
-                            else:
-                                img = Image.open(img)
-                        image = img.convert("RGB")
-                    else:
-                        raise ValueError(f"Image ID {image_id_str} not found in HuggingFace Dataset")
+                    if image_id_str not in hf_id_map:
+                        raise ValueError(
+                            f"Image ID {image_id_str!r} not found in HuggingFace dataset (sample index {i}). "
+                            f"Valid IDs are from the dataset's id column; check that JSON 'image' matches."
+                        )
+                    idx = hf_id_map[image_id_str]
+                    rec = hf_dataset[idx]
+                    img = rec.get("image")
+                    if img is None:
+                        raise ValueError(
+                            f"HuggingFace dataset row for image_id={image_id_str!r} has no 'image' column (sample index {i})."
+                        )
+                    if not isinstance(img, Image.Image):
+                        if hasattr(img, "shape"):
+                            img = Image.fromarray(img)
+                        else:
+                            img = Image.open(img)
+                    image = img.convert("RGB")
                 else:
-                    image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+                    image = _open_image_from_path(image_folder, image_file, sample_index=i)
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -820,9 +825,9 @@ class LazySupervisedDataset(Dataset):
                     try:
                         image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
                     except Exception as e:
-                        print('Wrong image', image_folder, image_file)
-                        print(e)
-                        raise e
+                        raise ValueError(
+                            f"Image preprocessing failed (sample index {i}, image: {image_file!r}): {e}"
+                        ) from e
             else:
                 if isinstance(image, list):
                     image = [processor.preprocess(img, return_tensors='pt')['pixel_values'][0] for img in image]
@@ -889,9 +894,68 @@ class DataCollatorForSupervisedDataset(object):
         return batch
 
 
+def _load_hf_dataset_from_image_folder(image_folder: str):
+    """
+    Load a HuggingFace dataset from a directory saved with save_to_disk (state.json + .arrow).
+    Returns (hf_dataset, hf_id_map) or raises ValueError if format is wrong or datasets not installed.
+    """
+    if not image_folder or not os.path.isdir(image_folder):
+        return None, None
+    state_path = os.path.join(image_folder, "state.json")
+    if not os.path.isfile(state_path):
+        return None, None
+
+    try:
+        from datasets import load_from_disk
+    except ImportError:
+        raise ValueError(
+            f"image_folder appears to be a HuggingFace saved dataset (found {state_path}) "
+            "but the 'datasets' library is not installed. Install with: pip install datasets"
+        ) from None
+
+    hf_ds = load_from_disk(image_folder)
+    id_col = None
+    for col in ("id", "image_id", "index", "idx"):
+        if col in hf_ds.column_names:
+            id_col = col
+            break
+    if id_col is not None:
+        hf_id_map = {str(row[id_col]): idx for idx, row in enumerate(hf_ds)}
+    else:
+        hf_id_map = {str(i): i for i in range(len(hf_ds))}
+    return hf_ds, hf_id_map
+
+
+def _open_image_from_path(image_folder: str, image_path: str, sample_index: int):
+    """Load image from disk. Raises ValueError if path is invalid or file missing."""
+    if not (image_folder and image_folder.strip()):
+        raise ValueError(
+            "image_folder is required for file-path based loading. "
+            "JSON 'image' must be a file path relative to image_folder (e.g. 'train/001.jpg'). "
+            "If your JSON uses image IDs (e.g. '2411422'), save images as a HuggingFace dataset "
+            "(datasets.Dataset.save_to_disk) in image_folder so the image-by-ID branch is used."
+        )
+    full_path = os.path.join(image_folder, image_path)
+    try:
+        return Image.open(full_path).convert("RGB")
+    except FileNotFoundError:
+        raise ValueError(
+            f"Image file not found: {full_path} (sample index {sample_index}, image field: {image_path!r}). "
+            "If your JSON uses image IDs, use a HuggingFace saved dataset in image_folder."
+        ) from None
+    except OSError as e:
+        raise ValueError(f"Invalid or unreadable image: {full_path} — {e}") from None
+
+
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
+    if getattr(data_args, "image_folder", None):
+        hf_ds, hf_id_map = _load_hf_dataset_from_image_folder(data_args.image_folder)
+        if hf_ds is not None:
+            data_args.hf_dataset = hf_ds
+            data_args.hf_id_map = hf_id_map
+            rank0_print(f"Loaded HuggingFace dataset from image_folder ({len(hf_ds)} rows); using image-by-ID.")
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args)

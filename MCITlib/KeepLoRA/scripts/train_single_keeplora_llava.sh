@@ -1,13 +1,13 @@
 #!/bin/bash
 
-#SBATCH --job-name=KeepLoRA_train_mixed2_epoch1_repo_bs8
+#SBATCH --job-name=KeepLoRA_train_mixed2_epoch1_repo_bs8_ga4
 #SBATCH --output=/shared/jeongeun/logs/%x-%j.out
 #SBATCH --error=/shared/jeongeun/logs/%x-%j.err
 #SBATCH --partition=batch
 #SBATCH --nodelist=vgi2
-#SBATCH --gres=gpu:rtx_4090:4
+#SBATCH --gres=gpu:pro_6000:1
 #SBATCH --cpus-per-gpu=4
-#SBATCH --mem=10G
+#SBATCH --mem=20G
 #SBATCH --time=0-08:00:00
 
 set -euo pipefail
@@ -31,13 +31,15 @@ WORK_DIR="/data/jeongeun"
 CKPT_DIR="${WORK_DIR}/checkpoints"
 
 IMAGE_FOLDER="${IMAGE_FOLDER:-${WORK_DIR}/datasets/MMMC_train}"
-DATA_PATH="${DATA_PATH:-${WORK_DIR}/datasets/vqa_ctx_train_8k_llava_mixed_levels_0_1_2_3_4.json}"
+DATA_PATH="${DATA_PATH:-${WORK_DIR}/datasets/vqa_ctx_train_8k_llava_random_level_8k.json}"
 
 SAVE_DIR="${SAVE_DIR:-${WORK_DIR}/checkpoints/}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SAVE_DIR}/llava-v1.5-7b-lora_mixed_1epoch_keeplora_repo}"
+# 기존 경로와 겹치지 않게 하려면 RUN_SUFFIX 설정 (예: export RUN_SUFFIX=ga4 또는 RUN_SUFFIX=20250306)
+RUN_SUFFIX="${RUN_SUFFIX:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-${SAVE_DIR}/llava-v1.5-7b-lora_random_level_8k_1epoch_keeplora_repo${RUN_SUFFIX:+_}${RUN_SUFFIX}}"
 
-# KeepLoRA 관련 설정
-KEEP_DIR="${KEEP_DIR:-${SAVE_DIR}/keeplora_single}"
+# KeepLoRA 관련 설정 (Task0, gradient 추출 결과도 RUN_SUFFIX로 구분)
+KEEP_DIR="${KEEP_DIR:-${SAVE_DIR}/keeplora_single${RUN_SUFFIX:+_}${RUN_SUFFIX}}"
 LORA_R="${LORA_R:-64}"
 DATA_RATIO="${DATA_RATIO:-0.2}"
 EPS_W="${EPS_W:-0.6}"   # epsilon_w (weight subspace)
@@ -52,6 +54,7 @@ fi
 echo "[INFO] 학습 데이터: ${DATA_PATH}"
 echo "[INFO] 학습 출력: ${OUTPUT_DIR}"
 echo "[INFO] KeepLoRA 작업 디렉토리: ${KEEP_DIR}"
+[[ -n "${RUN_SUFFIX}" ]] && echo "[INFO] RUN_SUFFIX=${RUN_SUFFIX} (경로 구분용)"
 
 cd "${ROOT_DIR}"
 
@@ -154,7 +157,7 @@ common_args=(
   --num_train_epochs 1
   --per_device_train_batch_size 8
   --per_device_eval_batch_size 4
-  --gradient_accumulation_steps 1
+  --gradient_accumulation_steps 4  
   --evaluation_strategy "no"
   --save_strategy "steps"
   --save_steps 50000

@@ -145,7 +145,15 @@ class DataArguments:
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
+    hf_image_split: Optional[str] = field(
+        default="train",
+        metadata={"help": "Preferred split name when image_folder points to a HuggingFace DatasetDict."},
+    )
     image_aspect_ratio: str = 'square'
+    train_skip_first_n: int = field(
+        default=0,
+        metadata={"help": "Skip first N examples from data_path (e.g. reserved for eval). Must be >= 0."},
+    )
 
 
 @dataclass
@@ -717,19 +725,234 @@ class LazySupervisedDataset(Dataset):
         if data_args.memory_data_path is not None:
             rank0_print("Adding memory data... {}".format(data_args.memory_data_path))
             list_memory_data_dict = json.load(open(data_args.memory_data_path, "r"))
-
             list_data_dict = list_data_dict + list_memory_data_dict
-            
             random.shuffle(list_data_dict)
+
+        skip_n = int(getattr(data_args, "train_skip_first_n", 0) or 0)
+        if skip_n < 0:
+            raise ValueError(f"train_skip_first_n must be >= 0, got {skip_n}")
+        if skip_n > 0:
+            if skip_n >= len(list_data_dict):
+                raise ValueError(
+                    f"train_skip_first_n={skip_n} is >= dataset size {len(list_data_dict)} for {data_path}"
+                )
+            rank0_print(f"Skipping first {skip_n} examples from {data_path} (reserved for eval).")
+            list_data_dict = list_data_dict[skip_n:]
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
-        # Optional HuggingFace Dataset support (image loaded by ID)
-        # Users can set these attributes on data_args before constructing the dataset.
-        self.hf_dataset = getattr(data_args, "hf_dataset", None)
-        self.hf_id_map = getattr(data_args, "hf_id_map", {})
+
+        self.hf_dataset = None
+        self.hf_id_map = {}
+        self.hf_id_field = None
+        self.requires_hf_images = bool(self.list_data_dict) and (
+            self.data_args.is_multimodal or any("image" in sample for sample in self.list_data_dict)
+        )
+        self._validate_json_sample_schema()
+        if self.requires_hf_images:
+            self._initialize_hf_image_dataset()
+
+    def _initialize_hf_image_dataset(self):
+        if not self.data_args.image_folder:
+            raise ValueError(
+                "image_folder is required and must point to a HuggingFace dataset saved with "
+                "datasets.Dataset.save_to_disk() or DatasetDict.save_to_disk()."
+            )
+
+        self.hf_dataset = self._try_load_hf_dataset(
+            self.data_args.image_folder,
+            preferred_split=getattr(self.data_args, "hf_image_split", None),
+        )
+        if self.hf_dataset is None:
+            raise ValueError(
+                f"image_folder={self.data_args.image_folder!r} is not a valid HuggingFace image dataset. "
+                "Expected a saved dataset containing an 'image' column and an ID column such as "
+                "'id', 'image_id', 'index', or 'idx'."
+            )
+
+        rank0_print(f"Loaded HuggingFace Dataset from {self.data_args.image_folder}")
+        self.hf_id_map, self.hf_id_field = self._index_hf_by_id(self.hf_dataset)
+        rank0_print(f"Indexed {len(self.hf_id_map)} images by {self.hf_id_field!r}")
+        self._validate_hf_image_references()
+
+    def _try_load_hf_dataset(self, dataset_path, preferred_split=None):
+        """Load a local Hugging Face dataset saved with save_to_disk()."""
+        try:
+            import datasets
+        except Exception as exc:
+            raise ValueError(
+                "The 'datasets' package is required to load the HuggingFace image dataset."
+            ) from exc
+        try:
+            ds = datasets.load_from_disk(dataset_path)
+        except Exception:
+            return None
+        if hasattr(ds, "keys"):
+            preferred_order = []
+            if preferred_split:
+                preferred_order.append(preferred_split)
+            preferred_order.extend(["train", "validation", "val", "test"])
+            chosen = None
+            for key in preferred_order:
+                if key in ds:
+                    chosen = ds[key]
+                    break
+            if chosen is None:
+                first_key = next(iter(ds.keys()))
+                chosen = ds[first_key]
+            ds_split = chosen
+        else:
+            ds_split = ds
+        if "image" in ds_split.column_names:
+            try:
+                import datasets as _datasets
+                ds_split = ds_split.cast_column("image", _datasets.Image(decode=True))
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to decode the 'image' column from HuggingFace dataset at {dataset_path!r}."
+                ) from exc
+            return ds_split
+        return None
+
+    def _index_hf_by_id(self, ds):
+        """HF dataset을 id 컬럼으로 인덱싱. (id_map: id_str -> row_index, id_field 이름)"""
+        id_col = None
+        for col in ("id", "image_id", "index", "idx"):
+            if col in ds.column_names:
+                id_col = col
+                break
+        if id_col is not None:
+            id_map = {}
+            for i in range(len(ds)):
+                key = str(ds[i][id_col])
+                # 동일 이미지 ID가 여러 행에 있으면 첫 번째 행만 사용 (같은 이미지이므로 하나만 매핑)
+                if key not in id_map:
+                    id_map[key] = i
+            return id_map, id_col
+        raise ValueError(
+            "HuggingFace image dataset must contain one of these ID columns: "
+            "'id', 'image_id', 'index', or 'idx'."
+        )
+
+    def _validate_json_sample_schema(self):
+        for sample_index, sample in enumerate(self.list_data_dict):
+            if not isinstance(sample, dict):
+                raise ValueError(
+                    f"Each JSON sample must be an object, but sample index {sample_index} is {type(sample).__name__}."
+                )
+            if "conversations" not in sample:
+                raise ValueError(f"Missing 'conversations' in JSON sample index {sample_index}.")
+            if not isinstance(sample["conversations"], list) or len(sample["conversations"]) == 0:
+                raise ValueError(
+                    f"'conversations' must be a non-empty list in JSON sample index {sample_index}."
+                )
+            if not self.requires_hf_images:
+                continue
+            if "image" not in sample:
+                raise ValueError(
+                    f"Missing 'image' in JSON sample index {sample_index}. "
+                    "This training pipeline requires image-text pairs for every sample."
+                )
+            image_ref = sample["image"]
+            if isinstance(image_ref, list):
+                if len(image_ref) == 0:
+                    raise ValueError(f"'image' list is empty in JSON sample index {sample_index}.")
+                for image_item in image_ref:
+                    if not isinstance(image_item, (str, int)):
+                        raise ValueError(
+                            f"Each image ID must be str or int in JSON sample index {sample_index}, "
+                            f"but got {type(image_item).__name__}."
+                        )
+            elif not isinstance(image_ref, (str, int)):
+                raise ValueError(
+                    f"'image' must be str, int, or a non-empty list of them in JSON sample index {sample_index}, "
+                    f"but got {type(image_ref).__name__}."
+                )
+
+    def _candidate_image_ids(self, image_ref):
+        candidates = []
+        seen = set()
+
+        def add(value):
+            value = str(value)
+            if value not in seen:
+                candidates.append(value)
+                seen.add(value)
+
+        add(image_ref)
+        if isinstance(image_ref, str):
+            stripped = image_ref.strip()
+            add(stripped)
+            if stripped.isdigit():
+                add(int(stripped))
+        return candidates
+
+    def _load_image_from_hf_dataset(self, image_ref, sample_index: int):
+        if self.hf_dataset is None:
+            return None
+
+        matched_idx = None
+        matched_id = None
+        for candidate in self._candidate_image_ids(image_ref):
+            if candidate in self.hf_id_map:
+                matched_idx = self.hf_id_map[candidate]
+                matched_id = candidate
+                break
+
+        if matched_idx is None:
+            id_source = self.hf_id_field or "row index"
+            raise ValueError(
+                f"Image ID {image_ref!r} not found in HuggingFace dataset (sample index {sample_index}). "
+                f"Matched against {id_source}; tried candidates={self._candidate_image_ids(image_ref)}."
+            )
+
+        rec = self.hf_dataset[matched_idx]
+        img = rec.get("image")
+        if img is None:
+            raise ValueError(
+                f"HuggingFace dataset row {matched_idx} for image_id={matched_id!r} has no 'image' value "
+                f"(sample index {sample_index})."
+            )
+        if not isinstance(img, Image.Image):
+            if hasattr(img, "shape"):
+                img = Image.fromarray(img)
+            else:
+                img = Image.open(img)
+        return img.convert("RGB")
+
+    def _validate_hf_image_references(self):
+        missing = []
+        checked = 0
+        for sample_index, sample in enumerate(self.list_data_dict):
+            if "image" not in sample:
+                continue
+            image_refs = sample["image"]
+            if not isinstance(image_refs, list):
+                image_refs = [image_refs]
+            for image_ref in image_refs:
+                checked += 1
+                if not any(candidate in self.hf_id_map for candidate in self._candidate_image_ids(image_ref)):
+                    missing.append((sample_index, image_ref))
+                    if len(missing) >= 10:
+                        break
+            if len(missing) >= 10:
+                break
+
+        if missing:
+            missing_preview = ", ".join(
+                f"(sample_index={sample_index}, image_id={image_ref!r})"
+                for sample_index, image_ref in missing
+            )
+            raise ValueError(
+                "JSON image IDs could not be matched to the HuggingFace image dataset. "
+                f"Checked split={getattr(self.data_args, 'hf_image_split', None) or 'auto'}, "
+                f"id_field={self.hf_id_field or 'row index'}. "
+                f"Examples: {missing_preview}"
+            )
+
+        rank0_print(f"Validated {checked} JSON image reference(s) against the HuggingFace image dataset.")
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -767,43 +990,15 @@ class LazySupervisedDataset(Dataset):
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
-            image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
 
-            # Two supported formats:
-            # 1) Image by ID: hf_dataset + hf_id_map set → JSON "image" is an ID, load from HF dataset.
-            # 2) Image by path: JSON "image" is a file path relative to image_folder.
             if isinstance(image_file, list):
-                # Multiple images per sample (only file-path based for now)
                 image = []
                 for img_file in image_file:
-                    img = _open_image_from_path(image_folder, img_file, sample_index=i)
+                    img = self._load_image_from_hf_dataset(img_file, sample_index=i)
                     image.append(img)
             else:
-                hf_dataset = getattr(self, "hf_dataset", None)
-                hf_id_map = getattr(self, "hf_id_map", None)
-                if hf_dataset is not None and hf_id_map:
-                    image_id_str = str(image_file)
-                    if image_id_str not in hf_id_map:
-                        raise ValueError(
-                            f"Image ID {image_id_str!r} not found in HuggingFace dataset (sample index {i}). "
-                            f"Valid IDs are from the dataset's id column; check that JSON 'image' matches."
-                        )
-                    idx = hf_id_map[image_id_str]
-                    rec = hf_dataset[idx]
-                    img = rec.get("image")
-                    if img is None:
-                        raise ValueError(
-                            f"HuggingFace dataset row for image_id={image_id_str!r} has no 'image' column (sample index {i})."
-                        )
-                    if not isinstance(img, Image.Image):
-                        if hasattr(img, "shape"):
-                            img = Image.fromarray(img)
-                        else:
-                            img = Image.open(img)
-                    image = img.convert("RGB")
-                else:
-                    image = _open_image_from_path(image_folder, image_file, sample_index=i)
+                image = self._load_image_from_hf_dataset(image_file, sample_index=i)
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -850,9 +1045,9 @@ class LazySupervisedDataset(Dataset):
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
         elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
-            crop_size = self.data_args.image_processor.crop_size
-            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            raise ValueError(
+                f"Missing image in JSON sample index {i}, but the training setup is multimodal."
+            )
         return data_dict
 
 
@@ -950,12 +1145,6 @@ def _open_image_from_path(image_folder: str, image_path: str, sample_index: int)
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    if getattr(data_args, "image_folder", None):
-        hf_ds, hf_id_map = _load_hf_dataset_from_image_folder(data_args.image_folder)
-        if hf_ds is not None:
-            data_args.hf_dataset = hf_ds
-            data_args.hf_id_map = hf_id_map
-            rank0_print(f"Loaded HuggingFace dataset from image_folder ({len(hf_ds)} rows); using image-by-ID.")
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args)
